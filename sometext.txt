@@ -1,0 +1,147 @@
+Django models, encapsulation and data integrity
+Bydabapps.com8 mins
+View Original
+A design issue we've found when building large Django applications is that model instances lack any real encapsulation. As codebases grow it becomes difficult to make any cast-iron guarantees that you really are enforcing application-level data integrity.
+We'll take an example of user accounts to demonstrate the issue here.
+STATUS_CHOICES = [
+    ('trial', 'Trial'),
+    ('signedup', 'Signed up'),
+    ('expired', 'Expired')
+]
+class Account(models.Model):
+    created = models.DateTimeField(auto_now_add=True)
+    status = models.CharField(choices=STATUS_CHOICES, max_length=10, db_index=True)
+    signup_date = models.DateTimeField(null=True)
+Here's a set of rules we'd like to impose on our account instances:
+An account may initially be created in the 'trial' state or the 'signedup' state.
+An account in the 'trial' or 'expired' state may be moved into the 'signedup' state at any time.
+After a 30 day period, an account in the 'trial' state will move into the 'expired' state.
+Let's take a first pass at implementing these rules. We start off with some logic inside a view named create_account.
+if 'signup' in request.POST:
+    account = Account(status='signedup', signup_date=timezone.now())
+else:
+    account = Account(status='trial')
+account.save()
+We also have another view for signing up existing 'trial' or 'expired' accounts, inside a view named signup_account:
+account.status = 'signedup'
+account.signup_date = timezone.now()
+For our account expiry, we implement some logic inside a management command named expire_old_trials that we run as a cron job.
+cutoff = timezone.now() - datetime.timedelta(days=30)
+Account.objects.filter(status='trial', created__lte=cutoff).update(status='expired')
+So, what's the problem here?
+Well, we've ended up splitting our logic across both the model code and the view code, breaking the encapsulation that the model class should provide.
+Here's some scenarios we could easily run into:
+A new view gets added that allows signups via some different code path. The developer creates the account instance with status='signedup', but does not notice that they should also be setting the .signup_date field.
+A developer is asked to manually move a user into the 'signedup' state. They do so in the Django shell, forgetting to set .signup_date.
+A new expiry_date field is added. The field value is properly set in the expire_trials management command, but the team fail to notice that it should also be set to None in the signup view.
+In each case we end up with an inconsistent data state.
+In our trivial example these kinds of errors would be reasonably easy to notice and avoid. However, in a large codebase they become increasingly difficult to spot and the risks increase.
+Beyond "Fat models, thin views"
+The standard advice here is to "Use fat models, and thin views". That's entirely correct, but it's also a little bit ill-defined. What constitutes a 'fat model'? How much logic is okay in view code? Does the 'fat models' convention still hold if we split business logic into nicely defined utility functions?
+I would rephrase this more strictly:
+Never write to a model field or call save() directly. Always use model methods and manager methods for state changing operations.
+This is a simple, unambiguous convention, that's easily enforceable at the point of code review.
+Doing so allows you to properly encapsulate your model instances, and allows you to impose strict application level constraints on which state changes are permitted.
+It follows that this rule also implies:
+Never call a model constructor directly.
+Never perform bulk updates or bulk deletes, except in model manager classes.
+If your team follows this rule and you adhere to it as a point of policy, you will be able to reason more confidently about your possible data states and valid state changes.
+This isn't about writing boilerplate setter properties for each field in the model, but rather about writing methods that encapsulate the point of interaction with the database layer. View code can still inspect any field on the model and perform logic based on that, but it should not modify that data directly.
+We're ensuring that there is a layer at which we can enforce application-level integrity constraints that exist on top of the integrity constraints that the database provides for us.
+Let's return to our example code, writing the state-changing logic entirely in the model and model manager classes.
+STATUS_CHOICES = [
+    ('trial', 'Trial'),
+    ('signedup', 'Signed up'),
+    ('expired', 'Expired')
+]
+TRIAL_DURATION = datetime.timedelta(days=30)
+class AccountManager(models.Manager):
+    def create_trial(self):
+        account = Account(status='trial')
+        account.save()
+        return account
+    def create_signup(self):
+        account = Account(status='signedup', signup_date=timezone.now())
+        account.save()
+        return account
+    def expire_old_trials(self):
+        cutoff = timezone.now() - TRIAL_DURATION
+        self.filter(status='trial', created__lte=cutoff).update(status='expired')
+class Account(models.Model):
+    created = models.DateTimeField(auto_now_add=True)
+    status = models.CharField(choices=STATUS_CHOICES, max_length=10, db_index=True)
+    signup_date = models.DateTimeField(null=True)
+    objects = AccountManager()
+    def signup(self):
+        assert self.status in ('trial', 'expired')
+        self.status = 'signedup'
+        self.signup_date = timezone.now()
+        self.save()
+Our state changes are now neatly encapsulated in a single module rather than being scattered across multiple source files.
+Our create_account view uses the model manager methods for object creation:
+if 'signup' in request.POST:
+    account = Account.objects.create_signup()
+else:
+    account = Account.objects.create_trial()
+In our signup_account view we use a model method to update the instance:
+account.signup()
+And our management command calls the .expire_old_trials() manager method:
+Account.objects.expire_old_trials()
+Related models and integrity
+Enforcing the "Never write to a model field or call save() directly." rule is particularly valuable when it comes to enforcing application data integrity between multiple model instances.
+A good example is when we have related instances that should always be created together. Rather than having our view code call into two separate .create() methods, we instead define both sets of required arguments on a single manager method, and ensure that the child instance is always created at the same point as creating the parent instance.
+Let's say we've created a new model BillingInfo, that will be used for storing information about signed-up accounts.
+class BillingInfo(models.Model):
+    account = models.OneToOneField('accounts.Account', related_name='billing_info')
+    address = models.TextField()
+    card_type = models.CharField(max_length=20, choices=CARD_TYPE_CHOICES)
+Whenever an account instance becomes 'signedup' we want to ensure that it always has an associated BillingInfo instance created.
+class AccountManager(models.Manager):
+    ...
+    def create_signup(self, address, card_type):
+        account = Account(status='signedup', signup_date=timezone.now())
+        account.save()
+        BillingInfo.objects.create(address=address, card_type=card_type, account=self)
+        return account
+class Account(models.Model):
+    ...
+    def signup(self, address, card_type):
+        assert self.status in ('trial', 'expired')
+        self.status = 'signedup'
+        self.signup_date = timezone.now()
+        self.save()
+        BillingInfo.objects.create(address=address, card_type=card_type, account=self)
+Because we're always using model methods and manager methods to perform state transitions it is easy to enforce that a populated BillingInfo object will always exist for any signed-up account.
+The signup and create_signup methods now take mandatory address and card_type arguments, and we can have a high degree of confidence in our possible data states.
+This is also a good point to note that our methods also give us natural boundaries around which to wrap transaction management. We can enforce atomicity of these state changes by placing the @transaction.atomic decorator around the model method or manager method.
+Updating multiple fields
+Often you will have model instances with a large number of fields that you want to allow updates on.
+I would still advise wrapping these updates in explicit methods. This allows you to be strict about which attributes may be updated. Here's a possible example that requires all update fields to be specified:
+def update(self, name, address, sort_code, phone_name, email):
+    self.name = name
+    self.address = address
+    self.sort_code = sort_code
+    self.phone_number = phone_number 
+    self.email = email
+    self.save()
+An alternative would allow fields to optional, but still limit which fields can be updated:
+def update(self, **kwargs):
+    allowed_attributes = {'name', 'address', 'sort_code', 'phone_number', 'email'}
+    for name, value in kwargs.items():
+        assert name in allowed_attributes
+        setattr(self, name, value)
+    self.save()
+Breaking the contract
+There's one particular part of Django that breaks the encapsulation contract that model classes ought to provide, which is the ModelForm class.
+When using ModelForm you cannot use model manager .create() methods to encapsulate instance creation because the validation process requires the object to be instantiated and saved as separate steps. Calling .is_valid() instantiates the object directly, and makes it available as form.object. This object is then saved and persisted when form.save() is called.
+Similarly, updates with ModelForm set properties on the model instance directly, and don't allow any easy way of encapsulating the allowable state changes in the model class.
+I've got more to say on this, but for now I'd simply advise to use ModelForm cautiously and to prefer explicit Form classes where possible.
+The constraint is also broken by Django REST framework's Serializer API, which follows a similar approach to validation as Django's ModelForm implementation. In the upcoming 3.0 release the validation step will become properly decoupled from the object-creation step, allowing you to strictly enforce model class encapsulation while using REST framework serializers.
+Test setup
+The only place in your code where you might legitimately choose to break the contact is during test setup. It probably is still cleaner to try to adhere to strict manager and model encapsulation if possible, but there's nothing terribly wrong with using shortcuts to create your initial test instances.
+The round-up
+The take-home of this post is the one simple convention that I'll repeat:
+Never write to a model field or call save() directly. Always use model methods and manager methods for state changing operations.
+The convention is more clear-cut and easier to follow that "Fat models, thin views", and does not exclude your team from laying an additional business logic layer on top of your models if suitable.
+Adopting this as part of your formal Django coding conventions will help your team ensure a good codebase style, and give you confidence in your application-level data integrity.
+Want to learn more? DabApps offers technical consultancy, as well as bespoke development services. To find out more, get in touch. You can also follow Tom on Twitter.
